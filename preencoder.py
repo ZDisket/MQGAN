@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import weight_norm
+from collections import OrderedDict
 
 from .attentions import ResidualBlock1D, APTx
 from .quantizer import FSQ
@@ -275,3 +276,81 @@ class PreEncoder(nn.Module):
             return x, last_hid
 
         return x
+
+
+def get_pre_encoder(model_path: str, device: str or torch.device, channels = [384, 512, 768], kernel_sizes=[7, 5, 3], mel_channels=88):
+    """
+    Loads a Pre-Encoder model from a checkpoint file.
+
+    Assumes the checkpoint was saved with the training script's structure,
+    containing 'model_state_dict' and 'args' (or a compatible dict).
+
+    Args:
+        model_path (str): Path to the .pth checkpoint file.
+        device (str or torch.device): The device to load the model onto ('cpu', 'cuda', etc.).
+
+    Returns:
+        tuple: A tuple containing:
+            - model (nn.Module): The loaded ResNetAutoencoder1D model instance,
+                                 moved to the specified device and set to eval mode.
+            - model_args (argparse.Namespace or dict): The configuration arguments
+                                                       used to initialize the model,
+                                                       loaded from the checkpoint.
+    Raises:
+        FileNotFoundError: If the model_path does not exist.
+        KeyError: If essential keys ('args', 'model_state_dict') are missing
+                  from the checkpoint.
+        RuntimeError: If load_state_dict fails (e.g., architecture mismatch).
+        ImportError: If the ResNetAutoencoder1D class cannot be imported/found.
+    """
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(f"Checkpoint file not found: {model_path}")
+
+    print(f"Loading checkpoint from: {model_path}")
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False) # Load to CPU first
+
+    # --- 2. Instantiate Model ---
+    try:
+        model = PreEncoder(mel_channels=mel_channels, channels=channels, kernel_sizes=kernel_sizes,
+                             dropout=0.0, fsq_levels=[8, 5, 5, 5])
+    except NameError:
+         raise ImportError("ResNetAutoencoder1D class definition not found. Ensure model.py is accessible or the class is defined.")
+    except Exception as e:
+         raise RuntimeError(f"Failed to instantiate model with loaded config: {e}")
+
+
+    # --- 3. Load Weights ---
+    if 'model_state_dict' in checkpoint:
+        pretrained_weights = checkpoint['model_state_dict']
+        print("Found weights under 'model_state_dict' key.")
+
+        # Optional: Handle 'module.' prefix (if saved using DataParallel/DDP)
+        clean_weights = OrderedDict()
+        has_module_prefix = False
+        for k, v in pretrained_weights.items():
+            if k.startswith('module.'):
+                has_module_prefix = True
+                clean_weights[k[7:]] = v # remove `module.`
+            else:
+                clean_weights[k] = v
+        if has_module_prefix:
+            print("Removed 'module.' prefix from weight keys.")
+        pretrained_weights = clean_weights # Use the cleaned dictionary
+
+        # Load the weights using strict=True (assumes exact match)
+        try:
+            model.load_state_dict(pretrained_weights, strict=True)
+            print("Successfully loaded model weights.")
+        except RuntimeError as e:
+            print(f"Error loading state_dict (likely architecture mismatch): {e}")
+            raise e # Re-raise the error
+
+    else:
+        raise KeyError(f"Checkpoint missing 'model_state_dict' key containing weights.")
+
+    # --- 4. Final Steps ---
+    model.to(device) # Move model to the target device
+    model.eval()     # Set model to evaluation mode
+    print(f"Model loaded onto {device} and set to evaluation mode.")
+
+    return model
