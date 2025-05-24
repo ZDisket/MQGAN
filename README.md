@@ -1,3 +1,7 @@
+# UNDER CONSTRUCTION
+
+This repo is messy and not quite done yet. It is mostly Julesslop
+
 # Isolated PreEncoder Model
 
 This directory contains an isolated version of the `PreEncoder` model and its necessary dependencies.
