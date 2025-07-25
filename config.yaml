@@ -1,0 +1,63 @@
+# Default configuration for train_autoencoder.py
+
+# ---------------------------------------------------------------------------
+# Dataset and loader
+# ---------------------------------------------------------------------------
+data_dir: "path/to/dataset"
+output_dir: "training_output"
+batch_size: 16
+num_workers: 0
+validation_split: 0.1
+
+# ---------------------------------------------------------------------------
+# Model parameters
+# ---------------------------------------------------------------------------
+mel_channels: 88
+latent_dim: 1024
+
+generator:
+  channels: [192, 768, 1024, 1024]
+  kernel_sizes: [3, 5, 7, 11]
+  dropout: 0.0
+  fsq_levels: [8, 5, 5, 5]
+
+discriminator_patch:
+  hidden_channels: [384, 384, 512, 512, 512]
+  kernel_sizes: [7, 7, 5, 5, 3, 3]
+  stride:
+    - [1, 2]
+    - [2, 2]
+    - [2, 2]
+    - [2, 2]
+    - [2, 2]
+    - [2, 2]
+
+discriminator_multibin:
+  n_bins: 8
+  hidden_channels: [128, 256, 256, 256, 256]
+  kernel_sizes: [7, 5, 5, 3, 3, 3]
+  n_no_strides: 2
+
+# ---------------------------------------------------------------------------
+# Training parameters
+# ---------------------------------------------------------------------------
+num_epochs: 20
+lr: 0.0001
+beta1: 0.9
+beta2: 0.999
+eval_interval: 2
+save_interval: 1
+num_plot_examples: 3
+seed: 42
+no_cuda: false
+pretrained: null
+warmup_steps: 3000
+crop_len: 256
+
+# ---------------------------------------------------------------------------
+# Weights & Biases
+# ---------------------------------------------------------------------------
+wandb:
+  project: "mqgan-autoencoder"
+  entity: null
+  name: null
