@@ -114,3 +114,69 @@ class LSGANLoss(nn.Module):
     ):
         real_tgt = torch.full_like(fake_output, self.real_label)
         return self._masked_mse(fake_output, real_tgt, fake_mask)
+
+
+
+
+class MaskedMelLoss(nn.Module):
+    """
+    Masked Charbonnier *or* MSE loss for mel-spectrograms, computed
+    **per-frequency-group** so every sub-band contributes equally.
+
+    Args
+    ----
+    loss_type  : "charbonnier" | "mse"
+    group_size : int
+        Number of mel bins per group.  Must divide C.
+        group_size = 1 reproduces the original behaviour.
+    eps        : ε for Charbonnier (ignored for MSE)
+    """
+    def __init__(
+        self,
+        loss_type: str = "charbonnier",
+        group_size: int = 1,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        assert loss_type in {"charbonnier", "mse"}
+        self.loss_type  = loss_type
+        self.group_size = group_size
+        self.eps        = eps
+
+    def forward(
+        self,
+        x: torch.Tensor,          # (B, T, C)
+        y: torch.Tensor,          # (B, T, C)
+        lengths: torch.LongTensor # (B,)
+    ) -> torch.Tensor:
+        assert x.shape == y.shape, "x and y must have the same shape"
+        B, T, C = x.shape
+        g       = self.group_size
+        assert C % g == 0, "C (n_mels) must be divisible by group_size"
+        G = C // g                      # number of frequency groups
+        device = x.device
+
+        # ---------- time-mask for padding ----------
+        idx  = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
+        mask = (idx >= lengths.unsqueeze(1)).unsqueeze(2).expand(B, T, C) # (B,T,C)
+
+        # ---------- reshape into groups ----------
+        x = x.view(B, T, G, g)          # (B, T, G, g)
+        y = y.view(B, T, G, g)
+        mask = mask.view(B, T, G, g)
+
+        # ---------- per-element loss ----------
+        diff = x - y
+        if self.loss_type == "charbonnier":
+            per_elem = torch.sqrt(diff.pow(2) + self.eps ** 2)
+        else:  # "mse"
+            per_elem = diff.pow(2)
+
+        per_elem = per_elem.masked_fill(mask, 0.0)
+
+        # ---------- reduce: mean inside each group, then mean over groups ----------
+        group_sum   = per_elem.sum(dim=[0, 1, 3])            # (G,)
+        valid_count = (~mask).float().sum(dim=[0, 1, 3])     # (G,)
+
+        group_loss = group_sum / (valid_count + 1e-12)       # (G,)
+        return group_loss.mean()                             # scalar

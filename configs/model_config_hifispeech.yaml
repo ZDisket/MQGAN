@@ -1,0 +1,56 @@
+
+# Configuration for MQGAN training
+
+project_name: "MQGAN"
+
+data:
+  data_dir: './hifispeech4'
+  output_dir: 'logs/mqgan_speech4_varcrop_newd'
+  validation_split: 0.02
+  crop_len: [256, 192, 128]
+  batch_size: 16
+  num_workers: 12
+
+model:
+  mel_channels: 128 # Number of mel frequency channels
+  generator:
+    channels: [512, 512, 768, 768]
+    kernel_sizes: [3, 3, 5, 7]
+    dropout: 0.1
+    fsq_levels: [8, 5, 5, 5]
+  discriminator_patch:
+    hidden_channels: [256, 256, 384, 512, 512]
+    kernel_sizes: [5,   5,   5,   3,   3,   3]
+    strides: [[1,2], [2,2], [2,2], [2,1], [2,1], [2,1]]
+  discriminator_multibin:
+    hidden_channels: [128, 128, 256, 256, 384]
+    kernel_sizes: [7, 5, 3, 3, 3, 3]
+    n_bins: 8
+    n_no_strides: 2
+
+training:
+  num_epochs: 1000
+  lr: 0.0001
+  beta1: 0.9
+  beta2: 0.999
+  lr_d_factor: 1.15
+  d_beta1: 0.5
+  d_beta2: 0.999
+  warmup_steps: 1000
+  discriminator_train_start_epoch: 0
+  loss_weights:
+    fm_lambda: 0.25
+    Gloss_lambda: 15.0
+    recon_lambda: 15.0
+  use_fm_loss: False
+  seed: 42
+  no_cuda: False
+  pretrained: null # path to pretrained model, or null
+
+logging:
+  eval_interval: 2
+  save_interval: 2
+  num_plot_examples: 10
+  wandb:
+    entity: null # Your wandb entity
+    project: "MQGAN"

@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils import weight_norm
+from torch.nn.utils.parametrizations import weight_norm
 from collections import OrderedDict
 
-from .attentions import ResidualBlock1D, APTx
-from .quantizer import FSQ
-
+from attentions import ResidualBlock1D, APTx
+from quantizer import FSQ
+import os
 
 def sequence_mask(max_length, x_lengths):
     """
@@ -146,9 +146,11 @@ class PreEncoder(nn.Module):
         self.q_in_proj = nn.Linear(latent_dim, self.quantizer_dim)
         self.quantizer = FSQ(levels=fsq_levels)
         self.q_out_proj = nn.Linear(self.quantizer_dim, latent_dim)
-        self.codebook_size = 8010  # TODO: dyn calculate this
-        self.bos_token_id = 8001
-        self.eos_token_id = 8002
+        self.codebook_size = 1
+        for level in fsq_levels:
+            self.codebook_size *= level
+        self.bos_token_id = self.codebook_size + 1
+        self.eos_token_id = self.codebook_size + 2
 
         # Decoder: use the reversed lists so that the decoder mirrors the encoder.
         rev_channels = list(reversed(channels))
@@ -278,7 +280,7 @@ class PreEncoder(nn.Module):
         return x
 
 
-def get_pre_encoder(model_path: str, device: str or torch.device, channels = [384, 512, 768], kernel_sizes=[7, 5, 3], mel_channels=88):
+def get_pre_encoder(model_path: str, device: str or torch.device, channels = [384, 512, 768], kernel_sizes=[7, 5, 3], mel_channels=88, fsq_levels=[8, 5, 5, 5]):
     """
     Loads a Pre-Encoder model from a checkpoint file.
 
@@ -312,7 +314,7 @@ def get_pre_encoder(model_path: str, device: str or torch.device, channels = [38
     # --- 2. Instantiate Model ---
     try:
         model = PreEncoder(mel_channels=mel_channels, channels=channels, kernel_sizes=kernel_sizes,
-                             dropout=0.0, fsq_levels=[8, 5, 5, 5])
+                             dropout=0.0, fsq_levels=fsq_levels)
     except NameError:
          raise ImportError("ResNetAutoencoder1D class definition not found. Ensure model.py is accessible or the class is defined.")
     except Exception as e:
