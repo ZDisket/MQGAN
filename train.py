@@ -5,6 +5,7 @@ import yaml
 import argparse
 import numpy as np
 import torch
+import glob
 
 # having this True is bad (both for CUDA and ROCm) when we use diff lens each batch
 torch.backends.cudnn.benchmark = False
@@ -44,22 +45,33 @@ def masked_mae(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, eps
     return diff.sum() / (valid_cnt + eps)
 
 
-def plot_mel_spectrogram(spectrogram, vmin, vmax, save_path=None, title='Mel Spectrogram', ylabel='Frequency',
-                         xlabel='Time'):
-    if isinstance(spectrogram, torch.Tensor):
-        spectrogram = spectrogram.float().cpu().detach().numpy()
-    if spectrogram.ndim != 2:
-        print(f"Error plotting: Spectrogram has unexpected shape {spectrogram.shape}. Expected 2D.")
-        return None
+def plot_mel_spectrograms(spectrograms, titles, vmin, vmax, save_path=None, main_title='Mel Spectrograms'):
+    """
+    Plots a list of mel spectrograms stacked vertically.
+    """
+    num_specs = len(spectrograms)
+    fig, axes = plt.subplots(num_specs, 1, figsize=(10, 4 * num_specs))
+    if num_specs == 1:
+        axes = [axes]
 
-    spectrogram_display = np.transpose(spectrogram, (1, 0))
-    fig, ax = plt.subplots(figsize=(10, 4))
-    im = ax.imshow(spectrogram_display, aspect='auto', origin='lower', vmin=vmin, vmax=vmax, cmap='magma')
-    fig.colorbar(im, ax=ax, format='%+2.0f dB')
-    ax.set_title(title)
-    ax.set_ylabel(ylabel)
-    ax.set_xlabel(xlabel)
-    plt.tight_layout()
+    for i in range(num_specs):
+        ax = axes[i]
+        spec = spectrograms[i]
+        if isinstance(spec, torch.Tensor):
+            spec = spec.float().cpu().detach().numpy()
+        if spec.ndim != 2:
+            print(f"Error plotting: Spectrogram has unexpected shape {spec.shape}. Expected 2D.")
+            continue
+
+        spectrogram_display = np.transpose(spec, (1, 0))
+        im = ax.imshow(spectrogram_display, aspect='auto', origin='lower', vmin=vmin, vmax=vmax, cmap='magma')
+        fig.colorbar(im, ax=ax, format='%+2.0f')
+        ax.set_title(titles[i])
+        ax.set_ylabel('Frequency')
+
+    axes[-1].set_xlabel('Time')
+    plt.suptitle(main_title)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -191,6 +203,7 @@ class Trainer:
     def __init__(self, config):
         self.config = config
         self.device = self._get_device()
+        self.start_epoch = 1
         self._setup_seeds()
 
         self.train_loader, self.eval_dataset = self._get_dataloaders()
@@ -210,7 +223,7 @@ class Trainer:
         self.scaler_g = GradScaler(enabled=self.device.type == 'cuda' and not self.use_bf16)
         self.scaler_d = GradScaler(enabled=self.device.type == 'cuda' and not self.use_bf16)
 
-        self._load_checkpoint()
+        self._init_checkpoint_handling()
         self._init_wandb()
 
     def _get_device(self):
@@ -320,10 +333,33 @@ class Trainer:
         )
         wandb.watch(self.generator, log="all")
 
-    def _load_checkpoint(self):
+    def _init_checkpoint_handling(self):
+        output_dir = self.config['data']['output_dir']
+        latest_ckpt = max(glob.glob(os.path.join(output_dir, 'checkpoint_epoch_*.pth')), key=os.path.getctime, default=None)
+
+        if latest_ckpt:
+            print(f"Found latest checkpoint: {latest_ckpt}")
+            self._load_full_checkpoint(latest_ckpt)
+        else:
+            self._load_pretrained_generator()
+
+    def _load_full_checkpoint(self, ckpt_path):
+        print(f"=> Loading full checkpoint for resuming training from '{ckpt_path}'")
+        checkpoint = torch.load(ckpt_path, map_location=self.device)
+
+        self.generator.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer_g.load_state_dict(checkpoint['optimizer_g_state_dict'])
+        self.optimizer_d.load_state_dict(checkpoint['optimizer_d_state_dict'])
+        self.scaler_g.load_state_dict(checkpoint['scaler_g_state_dict'])
+        self.scaler_d.load_state_dict(checkpoint['scaler_d_state_dict'])
+        self.start_epoch = checkpoint['epoch'] + 1
+
+        print(f"Loaded checkpoint from epoch {checkpoint['epoch']}. Resuming training from epoch {self.start_epoch}.")
+
+    def _load_pretrained_generator(self):
         ckpt_path = self.config['training']['pretrained']
         if ckpt_path and os.path.isfile(ckpt_path):
-            print(f"=> Loading checkpoint '{ckpt_path}'")
+            print(f"=> Loading pretrained generator from '{ckpt_path}'")
             checkpoint = torch.load(ckpt_path, map_location=self.device)
 
             if 'model_state_dict' in checkpoint:
@@ -334,7 +370,7 @@ class Trainer:
             clean_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
             self.generator.load_state_dict(clean_state_dict, strict=False)
-            print(f"Loaded generator checkpoint.")
+            print(f"Loaded pretrained generator checkpoint.")
         else:
             print("No pretrained checkpoint specified or found. Training from scratch.")
 
@@ -354,7 +390,8 @@ class Trainer:
             d_loss_mask_f = fake_mask_l2[0]
             f_logits = fake_logits_l2[i]
             loss_mbd += self.gan_loss.discriminator_loss(r_logits, f_logits, d_loss_mask_r, d_loss_mask_f)
-        loss_mbd /= len(real_logits_l2)
+        if len(real_logits_l2) > 0:
+            loss_mbd /= len(real_logits_l2)
 
         loss_d = loss_d1 + loss_mbd
         self.scaler_d.scale(loss_d).backward()
@@ -369,21 +406,26 @@ class Trainer:
 
         return loss_d.item()
 
-    def _train_generator(self, real_spectrograms, recon_spectrograms, mel_lens):
+    def _train_generator(self, real_spectrograms, recon_pre, recon_post, mel_lens):
         self.optimizer_g.zero_grad()
 
         self.patch_discriminator.eval()
         self.multibin_discriminator.eval()
 
-        loss_recon_all = self.recon_loss_all(recon_spectrograms, real_spectrograms, mel_lens)
-        loss_recon_g = self.recon_loss_group(recon_spectrograms, real_spectrograms, mel_lens)
-        loss_recon = loss_recon_all + loss_recon_g * 0.25
+        # Reconstruction losses
+        loss_recon_pre_all = self.recon_loss_all(recon_pre, real_spectrograms, mel_lens)
+        loss_recon_pre_g = self.recon_loss_group(recon_pre, real_spectrograms, mel_lens)
+        loss_recon_pre = loss_recon_pre_all + loss_recon_pre_g * 0.25
+
+        loss_recon_post_all = self.recon_loss_all(recon_post, real_spectrograms, mel_lens)
+        loss_recon_post_g = self.recon_loss_group(recon_post, real_spectrograms, mel_lens)
+        loss_recon_post = loss_recon_post_all + loss_recon_post_g * 0.25
 
         if self.epoch >= self.config['training']['discriminator_train_start_epoch']:
-            gen_logits, gen_mask, gen_feats = self.patch_discriminator(recon_spectrograms, mel_lens,
-                                                                       return_features=True)
-            gen_logits_l2, gen_mask_l2, gen_feats_l2 = self.multibin_discriminator(recon_spectrograms, mel_lens,
-                                                                                   return_features=True)
+            gen_logits, gen_mask, gen_feats = self.patch_discriminator(recon_post, mel_lens,
+                                                                        return_features=True)
+            gen_logits_l2, gen_mask_l2, gen_feats_l2 = self.multibin_discriminator(recon_post, mel_lens,
+                                                                                    return_features=True)
 
             loss_gan_d1 = self.gan_loss.generator_loss(gen_logits, gen_mask)
 
@@ -391,7 +433,8 @@ class Trainer:
             for i, g_logits in enumerate(gen_logits_l2):
                 g_loss_mask = gen_mask_l2[0]
                 loss_gan_mbd += self.gan_loss.generator_loss(g_logits, g_loss_mask)
-            loss_gan_mbd /= len(gen_logits_l2)
+            if len(gen_logits_l2) > 0:
+                loss_gan_mbd /= len(gen_logits_l2)
 
             loss_gan = 0.5 * (loss_gan_d1 + loss_gan_mbd)
 
@@ -413,7 +456,8 @@ class Trainer:
             loss_fm_d1 = torch.tensor(0.0, device=self.device)
             for (rf, mask), (ff, _) in zip(real_feats, gen_feats):
                 loss_fm_d1 += masked_mae(ff, rf, mask)
-            loss_fm_d1 /= len(real_feats)
+            if len(real_feats) > 0:
+                loss_fm_d1 /= len(real_feats)
 
             loss_fm_mbd = torch.tensor(0.0, device=self.device)
             for i in range(len(gen_feats_l2)):
@@ -429,7 +473,8 @@ class Trainer:
             loss_fm = 0.5 * (loss_fm_d1 + loss_fm_mbd)
 
         weights = self.config['training']['loss_weights']
-        total_loss_g = (loss_recon * weights['recon_lambda'] +
+        total_loss_g = (loss_recon_pre * weights.get('recon_lambda_pre', 1.0) +
+                        loss_recon_post * weights.get('recon_lambda_post', 2.0) +
                         loss_gan * current_gloss_lambda +
                         loss_fm * current_fmloss_lambda)
 
@@ -446,7 +491,8 @@ class Trainer:
 
         return {
             "loss_g_total": total_loss_g.item(),
-            "loss_recon": loss_recon.item(),
+            "loss_recon_pre": loss_recon_pre.item(),
+            "loss_recon_post": loss_recon_post.item(),
             "loss_gan": loss_gan.item(),
             "loss_fm": loss_fm.item()
         }
@@ -472,52 +518,54 @@ class Trainer:
                 continue
 
             with autocast(enabled=self.device.type == 'cuda', dtype=torch.bfloat16 if self.use_bf16 else torch.float16):
-                recon_spectrograms = self.generator(real_spectrograms, mel_lens)
+                recon_pre, recon_post = self.generator(real_spectrograms, mel_lens)
 
                 loss_d = 0.0
                 if epoch >= self.config['training']['discriminator_train_start_epoch']:
-                    loss_d = self._train_discriminator(real_spectrograms, recon_spectrograms, mel_lens)
+                    loss_d = self._train_discriminator(real_spectrograms, recon_post, mel_lens)
 
-                g_losses = self._train_generator(real_spectrograms, recon_spectrograms, mel_lens)
+                g_losses = self._train_generator(real_spectrograms, recon_pre, recon_post, mel_lens)
 
-            loop.set_postfix(D_loss=loss_d, G_loss=g_losses['loss_g_total'], Recon=g_losses['loss_recon'])
+            loop.set_postfix(D_loss=loss_d, G_loss=g_losses['loss_g_total'], Recon_Post=g_losses['loss_recon_post'])
             wandb.log({
                 "loss_d": loss_d,
                 **g_losses,
                 "learning_rate": self.scheduler_g.get_last_lr()[0]
             })
 
-        self._log_train_images(epoch, real_spectrograms, recon_spectrograms, mel_lens, filenames)
+        self._log_train_images(epoch, real_spectrograms, recon_pre, recon_post, mel_lens, filenames)
 
-    def _log_train_images(self, epoch, real_spectrograms, recon_spectrograms, mel_lens, filenames):
-        if not (real_spectrograms is not None and recon_spectrograms is not None):
+    def _log_train_images(self, epoch, real_spectrograms, recon_pre, recon_post, mel_lens, filenames):
+        if not (real_spectrograms is not None and recon_pre is not None and recon_post is not None):
             return
 
         plot_cfg = self.config['logging']
         plot_dir = os.path.join(self.config['data']['output_dir'], 'plots')
 
         with torch.no_grad():
-            vmin = min(real_spectrograms.min().item(), recon_spectrograms.min().item())
-            vmax = max(real_spectrograms.max().item(), recon_spectrograms.max().item())
+            vmin = min(real_spectrograms.min().item(), recon_pre.min().item(), recon_post.min().item())
+            vmax = max(real_spectrograms.max().item(), recon_pre.max().item(), recon_post.max().item())
 
         num_plots = min(plot_cfg['num_plot_examples'], real_spectrograms.size(0))
         log_dict = {}
         for i in range(num_plots):
             actual_len = mel_lens[i].item()
             original_spec = real_spectrograms[i, :actual_len, :]
-            recon_spec = recon_spectrograms[i, :actual_len, :]
+            recon_spec_pre = recon_pre[i, :actual_len, :]
+            recon_spec_post = recon_post[i, :actual_len, :]
             filename = filenames[i] if i < len(filenames) else f"Unknown_{i}"
 
             save_path_orig = os.path.join(plot_dir,
                                           f'epoch_{epoch:03d}_train_orig_{i + 1}_{os.path.splitext(filename)[0]}.png')
-            save_path_recon = os.path.join(plot_dir,
-                                           f'epoch_{epoch:03d}_train_recon_{i + 1}_{os.path.splitext(filename)[0]}.png')
+            save_path_recon_pre = os.path.join(plot_dir,
+                                               f'epoch_{epoch:03d}_train_recon_pre_{i + 1}_{os.path.splitext(filename)[0]}.png')
+            save_path_recon_post = os.path.join(plot_dir,
+                                                f'epoch_{epoch:03d}_train_recon_post_{i + 1}_{os.path.splitext(filename)[0]}.png')
 
-            log_dict[f"train_orig_{i + 1}"] = plot_mel_spectrogram(
-                original_spec, vmin, vmax, save_path_orig, f'Epoch {epoch} Train - Original'
-            )
-            log_dict[f"train_recon_{i + 1}"] = plot_mel_spectrogram(
-                recon_spec, vmin, vmax, save_path_recon, f'Epoch {epoch} Train - Reconstructed'
+            log_dict[f"train_comparison_{i + 1}"] = plot_mel_spectrograms(
+                [original_spec, recon_spec_pre, recon_spec_post],
+                ['Original', 'Reconstructed (Pre-Refiner)', 'Reconstructed (Post-Refiner)'],
+                vmin, vmax, save_path_orig, f'Epoch {epoch} Train - {os.path.splitext(filename)[0]}'
             )
         wandb.log(log_dict)
 
@@ -545,24 +593,26 @@ class Trainer:
 
                 with autocast(enabled=self.device.type == 'cuda',
                               dtype=torch.bfloat16 if self.use_bf16 else torch.float16):
-                    reconstructed = self.generator(sample_tensor, mel_len_tensor)
+                    recon_pre, recon_post = self.generator(sample_tensor, mel_len_tensor)
 
                 sample_to_plot = sample_tensor[0, :mel_len, :]
-                recon_to_plot = reconstructed[0, :mel_len, :]
+                recon_pre_to_plot = recon_pre[0, :mel_len, :]
+                recon_post_to_plot = recon_post[0, :mel_len, :]
 
-                vmin = min(sample_to_plot.min().item(), recon_to_plot.min().item())
-                vmax = max(sample_to_plot.max().item(), recon_to_plot.max().item())
+                vmin = min(sample_to_plot.min().item(), recon_pre_to_plot.min().item(), recon_post_to_plot.min().item())
+                vmax = max(sample_to_plot.max().item(), recon_pre_to_plot.max().item(), recon_post_to_plot.max().item())
 
                 save_path_orig = os.path.join(plot_dir,
                                               f'epoch_{epoch:03d}_eval_orig_{i + 1}_{os.path.splitext(filename)[0]}.png')
-                save_path_recon = os.path.join(plot_dir,
-                                               f'epoch_{epoch:03d}_eval_recon_{i + 1}_{os.path.splitext(filename)[0]}.png')
+                save_path_recon_pre = os.path.join(plot_dir,
+                                                   f'epoch_{epoch:03d}_eval_recon_pre_{i + 1}_{os.path.splitext(filename)[0]}.png')
+                save_path_recon_post = os.path.join(plot_dir,
+                                                    f'epoch_{epoch:03d}_eval_recon_post_{i + 1}_{os.path.splitext(filename)[0]}.png')
 
-                log_dict[f"eval_orig_{i + 1}"] = plot_mel_spectrogram(
-                    sample_to_plot, vmin, vmax, save_path_orig, f'Epoch {epoch} Eval - Original'
-                )
-                log_dict[f"eval_recon_{i + 1}"] = plot_mel_spectrogram(
-                    recon_to_plot, vmin, vmax, save_path_recon, f'Epoch {epoch} Eval - Reconstructed'
+                log_dict[f"eval_comparison_{i + 1}"] = plot_mel_spectrograms(
+                    [sample_to_plot, recon_pre_to_plot, recon_post_to_plot],
+                    ['Original', 'Reconstructed (Pre-Refiner)', 'Reconstructed (Post-Refiner)'],
+                    vmin, vmax, save_path_orig, f'Epoch {epoch} Eval - {os.path.splitext(filename)[0]}'
                 )
             wandb.log(log_dict)
 
@@ -587,7 +637,7 @@ class Trainer:
             print("Training dataloader is not available. Skipping training.")
             return
 
-        for epoch in range(1, self.config['training']['num_epochs'] + 1):
+        for epoch in range(self.start_epoch, self.config['training']['num_epochs'] + 1):
             self._train_epoch(epoch)
 
             if epoch % self.config['logging']['eval_interval'] == 0 and self.eval_dataset is not None:
@@ -605,6 +655,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train an MQGAN model.")
     parser.add_argument('--config', type=str, default='config.yaml', help='Path to the configuration file.')
     parser.add_argument('--pretrained', type=str, default=None, help='Path to a pretrained checkpoint to load.')
+    parser.add_argument('--output_dir', type=str, default=None, help="Path to the output directory, overriding config.")
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
@@ -612,6 +663,9 @@ def main():
 
     if args.pretrained:
         config['training']['pretrained'] = args.pretrained
+    
+    if args.output_dir:
+        config['data']['output_dir'] = args.output_dir
 
     trainer = Trainer(config)
     trainer.train()

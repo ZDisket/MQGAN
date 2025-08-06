@@ -20,6 +20,141 @@ def sequence_mask(max_length, x_lengths):
     return mask
 
 
+# ───────────────────────────── helpers ──────────────────────────────
+def wn_conv(in_ch, out_ch, k=3, s=1, g=1):
+    p = (k - 1) // 2            # same-padding
+    return weight_norm(nn.Conv2d(in_ch, out_ch, k, stride=s, padding=p, groups=g))
+
+def apply_mask(x, mask4d):
+    """Zero-out padded positions (mask=True) with masked_fill."""
+    if mask4d is not None:
+        x = x.masked_fill(mask4d, 0.0)
+    return x
+
+def downsample_mask(mask4d):
+    """(B,1,T,1) → pooled ½T in time using max (padding stays True)."""
+    return F.max_pool2d(mask4d.float(), kernel_size=(2,1), stride=(2,1)).bool()
+
+def upsample_mask(mask4d):
+    """Nearest upsample ×2 in time."""
+    return F.interpolate(mask4d.float(), scale_factor=(2,1), mode='nearest').bool()
+
+# ─────────────────────────── building blocks ─────────────────────────
+class ConvBlock(nn.Module):
+    def __init__(self, c_in, c_out, dropout=0.1):
+        super().__init__()
+        self.conv1 = wn_conv(c_in, c_out, k=3)
+        self.conv2 = wn_conv(c_out, c_out, k=3)
+        self.act   = APTx()
+        self.do    = nn.Dropout(dropout)
+        self.match = (c_in == c_out)
+
+    def forward(self, x, mask4d=None):
+        x = apply_mask(x, mask4d)
+        y = self.do(self.act(self.conv1(x)))
+        y = self.do(self.act(self.conv2(y)))
+        if self.match:
+            y = y + x
+        y = apply_mask(y, mask4d)
+        return y
+
+class DownBlock(nn.Module):
+    def __init__(self, c_in, c_out):
+        super().__init__()
+        self.pool  = nn.AvgPool2d(kernel_size=(2,1))       # time ↓2
+        self.conv  = ConvBlock(c_in, c_out)
+
+    def forward(self, x, mask4d=None):
+        x     = self.pool(x)
+        mask4 = downsample_mask(mask4d) if mask4d is not None else None
+        return self.conv(x, mask4), mask4
+
+class UpBlock(nn.Module):
+    def __init__(self, c_in, c_skip, c_out):
+        super().__init__()
+        self.up   = nn.Upsample(scale_factor=(2,1), mode='nearest')
+        self.conv = ConvBlock(c_in + c_skip, c_out)
+
+    def forward(self, x, skip, mask4d=None):
+        x = self.up(x)
+        mask4 = upsample_mask(mask4d) if mask4d is not None else None
+
+        # crop skip if odd padding causes 1-step mismatch
+        dt = skip.size(-2) - x.size(-2)
+        if dt > 0:
+            skip = skip[..., dt//2 : dt//2 + x.size(-2), :]
+
+        x = torch.cat([x, skip], dim=1)
+        return self.conv(x, mask4), mask4
+
+# ───────────────────────────── UNet Refiner ──────────────────────────
+class UNetRefiner(nn.Module):
+    """
+    Args:
+        base_ch   : channels of first stage (default 128)
+        depth     : number of down/up steps
+    Input:
+        x        : (B, T, F) or (B, 1, T, F)
+        x_mask   : (B, T)  bool, True = padded   (optional)
+    Output:
+        residual : (B, T, F)  (use y = x + residual)
+    """
+    def __init__(self, base_ch=128, depth=3, dropout=0.1):
+        super().__init__()
+        self.depth = depth
+        chs = [base_ch * (2**i) for i in range(depth + 1)]  # e.g. 128,256,512,1024
+
+        self.pre   = ConvBlock(1, chs[0], dropout)
+
+        # Down & Up stacks
+        self.downs = nn.ModuleList(
+            DownBlock(chs[i], chs[i+1]) for i in range(depth)
+        )
+        self.mid   = ConvBlock(chs[-1], chs[-1], dropout)
+
+        self.ups   = nn.ModuleList(
+            UpBlock(chs[depth - i], chs[depth - i -1], chs[depth - i -1])
+            for i in range(depth)
+        )
+
+        self.post  = wn_conv(chs[0], 1, k=3)
+
+    # ────────────────────────────────────────────────────────────────
+    def forward(self, x, x_mask: torch.Tensor | None = None):
+        if x.dim() == 3:                       # (B,T,F) → (B,1,T,F)
+            x = x.unsqueeze(1)
+        if x_mask is not None:
+            mask4 = x_mask.unsqueeze(1).unsqueeze(-1)  # (B,1,T,1)
+        else:
+            mask4 = None
+
+        skips   = []
+        x = self.pre(x, mask4)
+
+        # Down path
+        cur_mask = mask4
+        for down in self.downs:
+            skips.append(x)
+            x, cur_mask = down(x, cur_mask)
+
+        # Bottleneck
+        x = self.mid(x, cur_mask)
+
+        # Up path
+        for up in self.ups:
+            skip = skips.pop()
+            x, cur_mask = up(x, skip, cur_mask)
+
+        out = self.post(apply_mask(x, cur_mask))
+        out = out.squeeze(1)                  # (B,T,F)
+        if x_mask is not None:
+            out = out.masked_fill(x_mask.unsqueeze(-1), 0.0)
+        return out
+
+
+
+
+
 class ConvBlock2D(nn.Module):
     """
     2-D convolutional block that supports:
@@ -165,23 +300,26 @@ class PreEncoder(nn.Module):
         # Output projection: map from the decoder’s final channel (channels[0]) back to mel_channels.
         self.out_proj = nn.Linear(channels[0], mel_channels)
 
+        self.refiner = UNetRefiner(base_ch=128, depth=3)
+
     def forward(self, x, x_lengths):
         """
-        Forward pass.
+        Forward pass, for training only. For inference see .encode and .decode
 
         Parameters:
           - x: Tensor of shape (batch, mel_len, mel_channels)
           - x_lengths: (batch,), int lengths of each thing
         Returns:
-          - Reconstructed tensor of shape (batch, mel_len, mel_channels)
+          - x: Reconstructed tensor of shape (batch, mel_len, mel_channels)
+          - x_post: Reconstructed and refined tensor of shape (batch, mel_len, mel_channels)
         """
         # Project input to channel dimension channels[0]
         x = self.proj(x)  # (batch, mel_len, channels[0])
         # Permute to (batch, channels[0], mel_len) for 1D convolutions.
         x = x.permute(0, 2, 1)
 
-        x_mask = sequence_mask(x.size(2), x_lengths)
-        x_mask = x_mask.unsqueeze(1)  # (B, 1, T)
+        x_mask_orig = sequence_mask(x.size(2), x_lengths)
+        x_mask = x_mask_orig.unsqueeze(1)  # (B, 1, T)
         x = self.pre(x, x_mask)
 
         # Pass through the encoder blocks
@@ -206,7 +344,15 @@ class PreEncoder(nn.Module):
         # Final projection back to mel_channels
         x = self.out_proj(x)
 
-        return x
+        # Refiner step: Calculate residual.
+
+        residual = self.refiner(
+            x.detach(), # Detach: We want only the refiner to receive GAN gradients.
+            x_mask_orig)
+        x_post = x + residual
+
+
+        return x, x_post
 
     def encode(self, x, x_mask=None):
         """
@@ -274,6 +420,10 @@ class PreEncoder(nn.Module):
         x = x.permute(0, 2, 1)
         # Project back to the original mel_channels
         x = self.out_proj(x)
+
+        # Refiner step: Calculate residual.
+        x = x + self.refiner(x.detach(), x_mask)
+
         if return_hidden:
             return x, last_hid
 
