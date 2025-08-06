@@ -10,6 +10,7 @@ spectrogram:
   filter_length: 2048
   hop_length: 512
   win_length: 2048
-  n_mel_channels: 88
+  n_mel_channels: 160
   mel_fmin: 0.0
-  mel_fmax: 11025.0 
+  mel_fmax: 22050.0 
+  target_amplitude: 0.95

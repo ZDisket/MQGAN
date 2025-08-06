@@ -1,6 +1,6 @@
-# MQGAN: Music Quantized Generative Adversarial Network
+# MQGAN: Mel Quantization Generative Adversarial Network
 
-This repository contains the implementation of a Music Quantized Generative Adversarial Network (MQGAN) for audio synthesis. The project is structured to facilitate the entire workflow from data preparation to model deployment.
+This repository contains the implementation of (MQGAN) for audio synthesis. The project is structured to facilitate the entire workflow from data preparation to model deployment.
 
 ## Table of Contents
 
@@ -49,31 +49,15 @@ Use `convert_spectrograms.py` to transform your audio files (e.g., WAV, FLAC) in
 1.  **Prepare your audio data:** Place your audio files in an input directory. The script will mirror the directory structure in the output.
 
 2.  **Configure spectrogram extraction:**
-    Edit the `spec_config.yaml` file to define parameters for Mel spectrogram extraction, such as `sampling_rate`, `n_mel_channels`, `filter_length`, `hop_length`, etc.
-
-    Example `spec_config.yaml`:
-    ```yaml
-    io:
-      input_folder: "path/to/your/audio_files"
-      output_folder: "path/to/save/mels"
-      audio_extensions: [".wav", ".flac", ".mp3"] # Add/remove as needed
-    spectrogram:
-      sampling_rate: 22050
-      filter_length: 1024
-      hop_length: 256
-      win_length: 1024
-      n_mel_channels: 80
-      mel_fmin: 0.0
-      mel_fmax: 8000.0
-    ```
+    Edit the `spec_config.yaml` file to define parameters for Mel spectrogram extraction, such as `sampling_rate`, `n_mel_channels`, `filter_length`, `hop_length`, etc. You can find some at configs/
 
 3.  **Run the conversion script:**
     ```bash
-    python convert_spectrograms.py --config spec_config.yaml
+    python convert_spectrograms.py --config configs/spec_config_hifispeech.yaml
     ```
     You can override `input_folder` and `output_folder` directly from the command line:
     ```bash
-    python convert_spectrograms.py --config spec_config.yaml --input_folder /data/raw_audio --output_folder /data/mels
+    python convert_spectrograms.py --config configs/spec_config_hifispeech.yaml --input_folder /data/raw_audio --output_folder /data/mels
     ```
     The script will create `.npy` files in the specified `output_folder`, preserving the original directory structure.
 

@@ -39,7 +39,7 @@ training:
   d_beta1: 0.5
   d_beta2: 0.999
   warmup_steps: 1000
-  discriminator_train_start_epoch: 7
+  discriminator_train_start_epoch: 8
   loss_weights:
     fm_lambda: 0.25
     Gloss_lambda: 15.0
