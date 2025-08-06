@@ -280,7 +280,10 @@ class Trainer:
             channels=gen_cfg['channels'],
             kernel_sizes=gen_cfg['kernel_sizes'],
             dropout=gen_cfg['dropout'],
-            fsq_levels=gen_cfg['fsq_levels']
+            fsq_levels=gen_cfg['fsq_levels'],
+            refiner_base_channels=gen_cfg.get('refiner_base_channels', 128),
+            refiner_depth=gen_cfg.get('refiner_depth', 3),
+            refiner_hidden_proj_divisor=gen_cfg.get('refiner_hidden_proj_divisor', 8)
         ).to(self.device)
 
         patch_cfg = self.config['model']['discriminator_patch']

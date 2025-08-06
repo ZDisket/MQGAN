@@ -18,6 +18,8 @@ model:
     kernel_sizes: [3, 3, 5, 7]
     dropout: 0.0
     fsq_levels: [8, 5, 5, 5]
+    refiner_base_channels: 96
+    refiner_depth: 3
   discriminator_patch:
     hidden_channels: [384, 384, 512, 512, 512]
     kernel_sizes: [7, 7, 5, 5, 3, 3]

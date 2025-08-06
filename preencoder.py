@@ -7,6 +7,8 @@ from collections import OrderedDict
 from attentions import ResidualBlock1D, APTx
 from quantizer import FSQ
 import os
+from typing import Optional, Tuple
+import typing  # only for the Tuple type in TorchScript signature
 
 def sequence_mask(max_length, x_lengths):
     """
@@ -18,6 +20,45 @@ def sequence_mask(max_length, x_lengths):
     mask = torch.arange(max_length).expand(len(x_lengths), max_length).to(x_lengths.device)
     mask = mask >= x_lengths.unsqueeze(1)
     return mask
+
+@torch.jit.script
+def pad_to_pow2(
+    x: torch.Tensor,
+    x_mask: Optional[torch.Tensor],   # (B, T)  —  True = padding
+    depth: int                       # UNet depth ⇒ multiple = 2**depth
+) -> typing.Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """
+    Pads `x` on the *time* dimension (dim = -2) so its length becomes
+    a multiple of 2**depth. Padded frames are zero in `x` and True in `x_mask`.
+
+    Supports 3-D (B,T,F) or 4-D (B,1,T,F) inputs.
+    """
+    mult: int = 1 << depth                 # 2**depth
+    t: int = x.size(-2)
+    pad_len: int = (mult - (t % mult)) % mult
+    if pad_len != 0:
+        if x.dim() == 4:                   # (B,1,T,F)
+            pad_tensor = torch.zeros(
+                (x.size(0), x.size(1), pad_len, x.size(3)),
+                dtype=x.dtype, device=x.device
+            )
+            x = torch.cat((x, pad_tensor), dim=-2)
+        else:                              # (B,T,F)
+            pad_tensor = torch.zeros(
+                (x.size(0), pad_len, x.size(2)),
+                dtype=x.dtype, device=x.device
+            )
+            x = torch.cat((x, pad_tensor), dim=1)
+
+        if x_mask is not None:
+            pad_mask = torch.ones(
+                (x_mask.size(0), pad_len),
+                dtype=x_mask.dtype, device=x_mask.device
+            )
+            x_mask = torch.cat((x_mask, pad_mask), dim=1)
+
+    return x, x_mask
+
 
 
 # ───────────────────────────── helpers ──────────────────────────────
@@ -91,20 +132,21 @@ class UpBlock(nn.Module):
 class UNetRefiner(nn.Module):
     """
     Args:
-        base_ch   : channels of first stage (default 128)
-        depth     : number of down/up steps
+        in_channels: input channels (e.g. 2, for spec + hidden)
+        base_ch    : channels of first stage (default 128)
+        depth      : number of down/up steps
     Input:
-        x        : (B, T, F) or (B, 1, T, F)
+        x        : (B, C, T, F)
         x_mask   : (B, T)  bool, True = padded   (optional)
     Output:
         residual : (B, T, F)  (use y = x + residual)
     """
-    def __init__(self, base_ch=128, depth=3, dropout=0.1):
+    def __init__(self, in_channels, base_ch=128, depth=3, dropout=0.1, input_out_channels=[144, 128]):
         super().__init__()
         self.depth = depth
         chs = [base_ch * (2**i) for i in range(depth + 1)]  # e.g. 128,256,512,1024
 
-        self.pre   = ConvBlock(1, chs[0], dropout)
+        self.pre   = ConvBlock(in_channels, chs[0], dropout)
 
         # Down & Up stacks
         self.downs = nn.ModuleList(
@@ -118,13 +160,16 @@ class UNetRefiner(nn.Module):
         )
 
         self.post  = wn_conv(chs[0], 1, k=3)
+        self.reproj = nn.Linear(input_out_channels[0], input_out_channels[1], bias=False)
 
     # ────────────────────────────────────────────────────────────────
-    def forward(self, x, x_mask: torch.Tensor | None = None):
-        if x.dim() == 3:                       # (B,T,F) → (B,1,T,F)
-            x = x.unsqueeze(1)
-        if x_mask is not None:
-            mask4 = x_mask.unsqueeze(1).unsqueeze(-1)  # (B,1,T,1)
+    def forward(self, x: torch.Tensor, x_mask: torch.Tensor | None = None):
+        # x is already (B,C,T,F)
+        original_len = x.size(2)
+        x, x_mask_padded = pad_to_pow2(x, x_mask, self.depth)
+
+        if x_mask_padded is not None:
+            mask4 = x_mask_padded.unsqueeze(1).unsqueeze(-1)  # (B,1,T,1)
         else:
             mask4 = None
 
@@ -147,8 +192,15 @@ class UNetRefiner(nn.Module):
 
         out = self.post(apply_mask(x, cur_mask))
         out = out.squeeze(1)                  # (B,T,F)
+
+        # Crop back to original length
+        out = out[:, :original_len, :]
+
         if x_mask is not None:
             out = out.masked_fill(x_mask.unsqueeze(-1), 0.0)
+
+        out = self.reproj(out)
+
         return out
 
 
@@ -227,7 +279,7 @@ class ConvBlock2D(nn.Module):
         return tensor
 
     # --------------------------------------------------------------------- #
-    def forward(self, x: torch.Tensor, x_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, x_mask: torch.Tensor | None = None, return_hidden=False) -> torch.Tensor:
         """
         x       : (B, Cin, H, W)
         x_mask  : (B, 1, H, W) boolean, True = padding
@@ -243,14 +295,19 @@ class ConvBlock2D(nn.Module):
             out = self.conv(x)
 
         out = self._apply_mask(out, x_mask)
-        out = self.activation(out)
-        out = self.dropout(out)
+        hidden = self.activation(out)
+        out = self.dropout(hidden)
         out = self.conv_out(out)
-        return out.squeeze(1)
+        out = out.squeeze(1)
+
+        if return_hidden:
+            return out, hidden
+
+        return out
 
 
 class PreEncoder(nn.Module):
-    def __init__(self, mel_channels, channels, kernel_sizes, fsq_levels=[8, 8, 5, 5, 5], dropout=0.1):
+    def __init__(self, mel_channels, channels, kernel_sizes, fsq_levels=[8, 8, 5, 5, 5], dropout=0.1, refiner_base_channels=128, refiner_depth=3, refiner_hidden_proj_divisor=8):
         """
         Spectrogram Pre-Encoder.
         ResNet-based autoencoder with configurable encoder and decoder blocks.
@@ -299,8 +356,11 @@ class PreEncoder(nn.Module):
 
         # Output projection: map from the decoder’s final channel (channels[0]) back to mel_channels.
         self.out_proj = nn.Linear(channels[0], mel_channels)
+        self.refiner_hidden_channels = mel_channels // refiner_hidden_proj_divisor
+        self.hidden_proj = nn.Linear(channels[0], self.refiner_hidden_channels)
 
-        self.refiner = UNetRefiner(base_ch=128, depth=3)
+        self.refiner = UNetRefiner(in_channels=1, base_ch=refiner_base_channels, depth=refiner_depth,
+                                   input_out_channels=[mel_channels + self.refiner_hidden_channels, mel_channels])
 
     def forward(self, x, x_lengths):
         """
@@ -335,24 +395,30 @@ class PreEncoder(nn.Module):
         x = x.permute(0, 2, 1)
 
         # Pass through the decoder blocks
+        decoder_out = x
         for block in self.decoder_blocks:
-            x = block(x, x_mask=x_mask)
+            decoder_out = block(decoder_out, x_mask=x_mask)
 
-        x = self.post(x, x_mask)
+        x_recon_chans = self.post(decoder_out, x_mask)
         # Permute back to (batch, mel_len, channels[0])
-        x = x.permute(0, 2, 1)
+        x_recon_chans = x_recon_chans.permute(0, 2, 1)
         # Final projection back to mel_channels
-        x = self.out_proj(x)
+        x_recon = self.out_proj(x_recon_chans)
 
-        # Refiner step: Calculate residual.
+        # Refiner step: 
+        # 1. Project hidden state to mel_channels
+        hidden_for_refiner = self.hidden_proj(decoder_out.permute(0, 2, 1))
 
+        refiner_in = torch.cat([x_recon, hidden_for_refiner], dim=2) # append (B, T, Cmel + Chid)
+        refiner_in = refiner_in.unsqueeze(1) # (B, 1, T, Cmel + Chid)
+        # 3. Calculate residual
         residual = self.refiner(
-            x.detach(), # Detach: We want only the refiner to receive GAN gradients.
+            refiner_in.detach(), # Detach: We want only the refiner to receive GAN gradients.
             x_mask_orig)
-        x_post = x + residual
+        x_post = x_recon + residual
 
 
-        return x, x_post
+        return x_recon, x_post
 
     def encode(self, x, x_mask=None):
         """
@@ -409,28 +475,39 @@ class PreEncoder(nn.Module):
             x_mask = torch.zeros((x.size(0), 1, x.size(2)), device=x.device).bool()
 
         # Pass through the decoder blocks
+        decoder_out = x
         for block in self.decoder_blocks:
-            x = block(x, x_mask=x_mask)
+            decoder_out = block(decoder_out, x_mask=x_mask)
 
         if return_hidden:
-            last_hid = x.clone()
+            last_hid = decoder_out.clone()
 
-        x = self.post(x, x_mask)
+        x_recon_chans = self.post(decoder_out, x_mask)
         # Permute back to (batch, mel_len, latent_dim)
-        x = x.permute(0, 2, 1)
+        x_recon_chans = x_recon_chans.permute(0, 2, 1)
         # Project back to the original mel_channels
-        x = self.out_proj(x)
+        x_recon = self.out_proj(x_recon_chans)
 
-        # Refiner step: Calculate residual.
-        x = x + self.refiner(x.detach(), x_mask)
+        # Refiner step: 
+        # 1. Project hidden state to mel_channels
+        hidden_for_refiner = self.hidden_proj(decoder_out.permute(0, 2, 1))
+
+        refiner_in = torch.cat([x_recon, hidden_for_refiner], dim=2)  # append (B, T, Cmel + Chid)
+        refiner_in = refiner_in.unsqueeze(1)  # (B, 1, T, Cmel + Chid)
+
+        # 3. Calculate residual
+        residual = self.refiner(
+            refiner_in.detach(), # Detach: We want only the refiner to receive GAN gradients.
+            x_mask.squeeze(1)) # x_mask is (B, 1, T), refiner expects (B, T)
+        x_post = x_recon + residual
 
         if return_hidden:
-            return x, last_hid
+            return x_post, last_hid
 
-        return x
+        return x_post
 
 
-def get_pre_encoder(model_path: str, device: str or torch.device, channels = [384, 512, 768], kernel_sizes=[7, 5, 3], mel_channels=88, fsq_levels=[8, 5, 5, 5]):
+def get_pre_encoder(model_path: str, device: str or torch.device, channels = [384, 512, 768], kernel_sizes=[7, 5, 3], mel_channels=88, fsq_levels=[8, 5, 5, 5], refiner_base_channels=128, refiner_depth=3, refiner_hidden_proj_divisor=8):
     """
     Loads a Pre-Encoder model from a checkpoint file.
 
@@ -464,7 +541,7 @@ def get_pre_encoder(model_path: str, device: str or torch.device, channels = [38
     # --- 2. Instantiate Model ---
     try:
         model = PreEncoder(mel_channels=mel_channels, channels=channels, kernel_sizes=kernel_sizes,
-                             dropout=0.0, fsq_levels=fsq_levels)
+                             dropout=0.0, fsq_levels=fsq_levels, refiner_base_channels=refiner_base_channels, refiner_depth=refiner_depth, refiner_hidden_proj_divisor=refiner_hidden_proj_divisor)
     except NameError:
          raise ImportError("ResNetAutoencoder1D class definition not found. Ensure model.py is accessible or the class is defined.")
     except Exception as e:
