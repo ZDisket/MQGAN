@@ -9,6 +9,8 @@ from quantizer import FSQ
 import os
 from typing import Optional, Tuple
 import typing  # only for the Tuple type in TorchScript signature
+from torch.nn.utils import remove_weight_norm
+
 
 def sequence_mask(max_length, x_lengths):
     """
@@ -21,50 +23,35 @@ def sequence_mask(max_length, x_lengths):
     mask = mask >= x_lengths.unsqueeze(1)
     return mask
 
-@torch.jit.script
-def pad_to_pow2(
-    x: torch.Tensor,
-    x_mask: Optional[torch.Tensor],   # (B, T)  —  True = padding
-    depth: int                       # UNet depth ⇒ multiple = 2**depth
-) -> typing.Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """
-    Pads `x` on the *time* dimension (dim = -2) so its length becomes
-    a multiple of 2**depth. Padded frames are zero in `x` and True in `x_mask`.
 
-    Supports 3-D (B,T,F) or 4-D (B,1,T,F) inputs.
-    """
-    mult: int = 1 << depth                 # 2**depth
-    t: int = x.size(-2)
-    pad_len: int = (mult - (t % mult)) % mult
-    if pad_len != 0:
-        if x.dim() == 4:                   # (B,1,T,F)
-            pad_tensor = torch.zeros(
-                (x.size(0), x.size(1), pad_len, x.size(3)),
-                dtype=x.dtype, device=x.device
-            )
-            x = torch.cat((x, pad_tensor), dim=-2)
-        else:                              # (B,T,F)
-            pad_tensor = torch.zeros(
-                (x.size(0), pad_len, x.size(2)),
-                dtype=x.dtype, device=x.device
-            )
-            x = torch.cat((x, pad_tensor), dim=1)
 
-        if x_mask is not None:
-            pad_mask = torch.ones(
-                (x_mask.size(0), pad_len),
-                dtype=x_mask.dtype, device=x_mask.device
-            )
-            x_mask = torch.cat((x_mask, pad_mask), dim=1)
+# controlflowless, torchscript trace-friendly
+def pad_to_pow2_4d(x, x_mask, depth):
+    # x: (B, 1, T, F)
+    # x_mask: (B, T)
+    mult = 1 << depth
+    B = x.size(0)
+    C = x.size(1)  # expect 1
+    T = x.size(2)
+    F = x.size(3)
 
-    return x, x_mask
+    pad_len = (mult - (T % mult)) % mult
 
+    x_pad = torch.zeros((B, C, pad_len, F), dtype=x.dtype, device=x.device)
+    x_out = torch.cat((x, x_pad), dim=2)  # (B,1,T',F)
+
+    m_pad = torch.ones((B, pad_len), dtype=x_mask.dtype, device=x_mask.device)
+    m_out = torch.cat((x_mask, m_pad), dim=1)  # (B, T')
+    m_out = m_out.reshape(B, 1, m_out.size(1), 1)  # (B,1,T',1)
+
+    return x_out, m_out
 
 
 # ───────────────────────────── helpers ──────────────────────────────
 def wn_conv(in_ch, out_ch, k=3, s=1, g=1):
-    p = (k - 1) // 2            # same-padding
+    p = (k - 1) // 2  # same-padding
     return weight_norm(nn.Conv2d(in_ch, out_ch, k, stride=s, padding=p, groups=g))
+
 
 def apply_mask(x, mask4d):
     """Zero-out padded positions (mask=True) with masked_fill."""
@@ -72,13 +59,28 @@ def apply_mask(x, mask4d):
         x = x.masked_fill(mask4d, 0.0)
     return x
 
+
 def downsample_mask(mask4d):
     """(B,1,T,1) → pooled ½T in time using max (padding stays True)."""
-    return F.max_pool2d(mask4d.float(), kernel_size=(2,1), stride=(2,1)).bool()
+    return F.max_pool2d(mask4d.float(), kernel_size=(2, 1), stride=(2, 1)).bool()
+
 
 def upsample_mask(mask4d):
     """Nearest upsample ×2 in time."""
-    return F.interpolate(mask4d.float(), scale_factor=(2,1), mode='nearest').bool()
+    return F.interpolate(mask4d.float(), scale_factor=(2, 1), mode='nearest').bool()
+
+
+@torch.jit.script
+def crop_to_match(skip, x_like):
+    # center-crop skip's time dim to match x_like.size(-2)
+    target_T = x_like.size(-2)
+    dt = skip.size(-2) - target_T
+    if dt > 0:
+        start = dt // 2
+        return skip[..., start:start + target_T, :]
+    else:
+        return skip
+
 
 # ─────────────────────────── building blocks ─────────────────────────
 class ConvBlock(nn.Module):
@@ -86,8 +88,8 @@ class ConvBlock(nn.Module):
         super().__init__()
         self.conv1 = wn_conv(c_in, c_out, k=3)
         self.conv2 = wn_conv(c_out, c_out, k=3)
-        self.act   = APTx()
-        self.do    = nn.Dropout(dropout)
+        self.act = APTx()
+        self.do = nn.Dropout(dropout)
         self.match = (c_in == c_out)
 
     def forward(self, x, mask4d=None):
@@ -99,34 +101,34 @@ class ConvBlock(nn.Module):
         y = apply_mask(y, mask4d)
         return y
 
+
 class DownBlock(nn.Module):
     def __init__(self, c_in, c_out):
         super().__init__()
-        self.pool  = nn.AvgPool2d(kernel_size=(2,1))       # time ↓2
-        self.conv  = ConvBlock(c_in, c_out)
+        self.pool = nn.AvgPool2d(kernel_size=(2, 1))  # time ↓2
+        self.conv = ConvBlock(c_in, c_out)
 
     def forward(self, x, mask4d=None):
-        x     = self.pool(x)
+        x = self.pool(x)
         mask4 = downsample_mask(mask4d) if mask4d is not None else None
         return self.conv(x, mask4), mask4
+
 
 class UpBlock(nn.Module):
     def __init__(self, c_in, c_skip, c_out):
         super().__init__()
-        self.up   = nn.Upsample(scale_factor=(2,1), mode='nearest')
+        self.up = nn.Upsample(scale_factor=(2, 1), mode='nearest')
         self.conv = ConvBlock(c_in + c_skip, c_out)
 
     def forward(self, x, skip, mask4d=None):
         x = self.up(x)
         mask4 = upsample_mask(mask4d) if mask4d is not None else None
 
-        # crop skip if odd padding causes 1-step mismatch
-        dt = skip.size(-2) - x.size(-2)
-        if dt > 0:
-            skip = skip[..., dt//2 : dt//2 + x.size(-2), :]
+        skip = crop_to_match(skip, x)
 
         x = torch.cat([x, skip], dim=1)
         return self.conv(x, mask4), mask4
+
 
 # ───────────────────────────── UNet Refiner ──────────────────────────
 class UNetRefiner(nn.Module):
@@ -141,39 +143,35 @@ class UNetRefiner(nn.Module):
     Output:
         residual : (B, T, F)  (use y = x + residual)
     """
+
     def __init__(self, in_channels, base_ch=128, depth=3, dropout=0.1, input_out_channels=[144, 128]):
         super().__init__()
         self.depth = depth
-        chs = [base_ch * (2**i) for i in range(depth + 1)]  # e.g. 128,256,512,1024
+        chs = [base_ch * (2 ** i) for i in range(depth + 1)]  # e.g. 128,256,512,1024
 
-        self.pre   = ConvBlock(in_channels, chs[0], dropout)
+        self.pre = ConvBlock(in_channels, chs[0], dropout)
 
         # Down & Up stacks
         self.downs = nn.ModuleList(
-            DownBlock(chs[i], chs[i+1]) for i in range(depth)
+            DownBlock(chs[i], chs[i + 1]) for i in range(depth)
         )
-        self.mid   = ConvBlock(chs[-1], chs[-1], dropout)
+        self.mid = ConvBlock(chs[-1], chs[-1], dropout)
 
-        self.ups   = nn.ModuleList(
-            UpBlock(chs[depth - i], chs[depth - i -1], chs[depth - i -1])
+        self.ups = nn.ModuleList(
+            UpBlock(chs[depth - i], chs[depth - i - 1], chs[depth - i - 1])
             for i in range(depth)
         )
 
-        self.post  = wn_conv(chs[0], 1, k=3)
+        self.post = wn_conv(chs[0], 1, k=3)
         self.reproj = nn.Linear(input_out_channels[0], input_out_channels[1], bias=False)
 
     # ────────────────────────────────────────────────────────────────
     def forward(self, x: torch.Tensor, x_mask: torch.Tensor | None = None):
         # x is already (B,C,T,F)
         original_len = x.size(2)
-        x, x_mask_padded = pad_to_pow2(x, x_mask, self.depth)
+        x, mask4 = pad_to_pow2_4d(x, x_mask, self.depth)
 
-        if x_mask_padded is not None:
-            mask4 = x_mask_padded.unsqueeze(1).unsqueeze(-1)  # (B,1,T,1)
-        else:
-            mask4 = None
-
-        skips   = []
+        skips = []
         x = self.pre(x, mask4)
 
         # Down path
@@ -191,7 +189,7 @@ class UNetRefiner(nn.Module):
             x, cur_mask = up(x, skip, cur_mask)
 
         out = self.post(apply_mask(x, cur_mask))
-        out = out.squeeze(1)                  # (B,T,F)
+        out = out.squeeze(1)  # (B,T,F)
 
         # Crop back to original length
         out = out[:, :original_len, :]
@@ -202,9 +200,6 @@ class UNetRefiner(nn.Module):
         out = self.reproj(out)
 
         return out
-
-
-
 
 
 class ConvBlock2D(nn.Module):
@@ -307,7 +302,8 @@ class ConvBlock2D(nn.Module):
 
 
 class PreEncoder(nn.Module):
-    def __init__(self, mel_channels, channels, kernel_sizes, fsq_levels=[8, 8, 5, 5, 5], dropout=0.1, refiner_base_channels=128, refiner_depth=3, refiner_hidden_proj_divisor=8):
+    def __init__(self, mel_channels, channels, kernel_sizes, fsq_levels=[8, 8, 5, 5, 5], dropout=0.1,
+                 refiner_base_channels=128, refiner_depth=3, refiner_hidden_proj_divisor=8):
         """
         Spectrogram Pre-Encoder.
         ResNet-based autoencoder with configurable encoder and decoder blocks.
@@ -362,6 +358,8 @@ class PreEncoder(nn.Module):
         self.refiner = UNetRefiner(in_channels=1, base_ch=refiner_base_channels, depth=refiner_depth,
                                    input_out_channels=[mel_channels + self.refiner_hidden_channels, mel_channels])
 
+        # self.refiner = torch.jit.script(self.refiner)
+
     def forward(self, x, x_lengths):
         """
         Forward pass, for training only. For inference see .encode and .decode
@@ -405,18 +403,17 @@ class PreEncoder(nn.Module):
         # Final projection back to mel_channels
         x_recon = self.out_proj(x_recon_chans)
 
-        # Refiner step: 
+        # Refiner step:
         # 1. Project hidden state to mel_channels
         hidden_for_refiner = self.hidden_proj(decoder_out.permute(0, 2, 1))
 
-        refiner_in = torch.cat([x_recon, hidden_for_refiner], dim=2) # append (B, T, Cmel + Chid)
-        refiner_in = refiner_in.unsqueeze(1) # (B, 1, T, Cmel + Chid)
+        refiner_in = torch.cat([x_recon, hidden_for_refiner], dim=2)  # append (B, T, Cmel + Chid)
+        refiner_in = refiner_in.unsqueeze(1)  # (B, 1, T, Cmel + Chid)
         # 3. Calculate residual
         residual = self.refiner(
-            refiner_in.detach(), # Detach: We want only the refiner to receive GAN gradients.
+            refiner_in.detach(),  # Detach: We want only the refiner to receive GAN gradients.
             x_mask_orig)
         x_post = x_recon + residual
-
 
         return x_recon, x_post
 
@@ -488,7 +485,7 @@ class PreEncoder(nn.Module):
         # Project back to the original mel_channels
         x_recon = self.out_proj(x_recon_chans)
 
-        # Refiner step: 
+        # Refiner step:
         # 1. Project hidden state to mel_channels
         hidden_for_refiner = self.hidden_proj(decoder_out.permute(0, 2, 1))
 
@@ -497,8 +494,8 @@ class PreEncoder(nn.Module):
 
         # 3. Calculate residual
         residual = self.refiner(
-            refiner_in.detach(), # Detach: We want only the refiner to receive GAN gradients.
-            x_mask.squeeze(1)) # x_mask is (B, 1, T), refiner expects (B, T)
+            refiner_in.detach(),  # Detach: We want only the refiner to receive GAN gradients.
+            x_mask.squeeze(1))  # x_mask is (B, 1, T), refiner expects (B, T)
         x_post = x_recon + residual
 
         if return_hidden:
@@ -507,7 +504,19 @@ class PreEncoder(nn.Module):
         return x_post
 
 
-def get_pre_encoder(model_path: str, device: str or torch.device, channels = [384, 512, 768], kernel_sizes=[7, 5, 3], mel_channels=88, fsq_levels=[8, 5, 5, 5], refiner_base_channels=128, refiner_depth=3, refiner_hidden_proj_divisor=8):
+def strip_weight_norm(module):
+    for m in module.modules():
+        for name in ("weight_g", "weight_v"):
+            if hasattr(m, name):
+                try:
+                    remove_weight_norm(m)
+                except Exception:
+                    pass
+
+
+def get_pre_encoder(model_path: str, device: str or torch.device, channels=[384, 512, 768], kernel_sizes=[7, 5, 3],
+                    mel_channels=88, fsq_levels=[8, 5, 5, 5], refiner_base_channels=128, refiner_depth=3,
+                    refiner_hidden_proj_divisor=8, inference=False):
     """
     Loads a Pre-Encoder model from a checkpoint file.
 
@@ -536,17 +545,18 @@ def get_pre_encoder(model_path: str, device: str or torch.device, channels = [38
         raise FileNotFoundError(f"Checkpoint file not found: {model_path}")
 
     print(f"Loading checkpoint from: {model_path}")
-    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False) # Load to CPU first
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)  # Load to CPU first
 
     # --- 2. Instantiate Model ---
     try:
         model = PreEncoder(mel_channels=mel_channels, channels=channels, kernel_sizes=kernel_sizes,
-                             dropout=0.0, fsq_levels=fsq_levels, refiner_base_channels=refiner_base_channels, refiner_depth=refiner_depth, refiner_hidden_proj_divisor=refiner_hidden_proj_divisor)
+                           dropout=0.0, fsq_levels=fsq_levels, refiner_base_channels=refiner_base_channels,
+                           refiner_depth=refiner_depth, refiner_hidden_proj_divisor=refiner_hidden_proj_divisor)
     except NameError:
-         raise ImportError("ResNetAutoencoder1D class definition not found. Ensure model.py is accessible or the class is defined.")
+        raise ImportError(
+            "ResNetAutoencoder1D class definition not found. Ensure model.py is accessible or the class is defined.")
     except Exception as e:
-         raise RuntimeError(f"Failed to instantiate model with loaded config: {e}")
-
+        raise RuntimeError(f"Failed to instantiate model with loaded config: {e}")
 
     # --- 3. Load Weights ---
     if 'model_state_dict' in checkpoint:
@@ -559,12 +569,12 @@ def get_pre_encoder(model_path: str, device: str or torch.device, channels = [38
         for k, v in pretrained_weights.items():
             if k.startswith('module.'):
                 has_module_prefix = True
-                clean_weights[k[7:]] = v # remove `module.`
+                clean_weights[k[7:]] = v  # remove `module.`
             else:
                 clean_weights[k] = v
         if has_module_prefix:
             print("Removed 'module.' prefix from weight keys.")
-        pretrained_weights = clean_weights # Use the cleaned dictionary
+        pretrained_weights = clean_weights  # Use the cleaned dictionary
 
         # Load the weights using strict=True (assumes exact match)
         try:
@@ -572,14 +582,18 @@ def get_pre_encoder(model_path: str, device: str or torch.device, channels = [38
             print("Successfully loaded model weights.")
         except RuntimeError as e:
             print(f"Error loading state_dict (likely architecture mismatch): {e}")
-            raise e # Re-raise the error
+            raise e  # Re-raise the error
 
     else:
         raise KeyError(f"Checkpoint missing 'model_state_dict' key containing weights.")
 
     # --- 4. Final Steps ---
-    model.to(device) # Move model to the target device
-    model.eval()     # Set model to evaluation mode
+    model.to(device)  # Move model to the target device
+    model.eval()  # Set model to evaluation mode
+
+    if inference:
+        strip_weight_norm(model)
+
     print(f"Model loaded onto {device} and set to evaluation mode.")
 
     return model

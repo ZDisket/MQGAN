@@ -47,16 +47,22 @@ def main():
             mel_channels=mel_channels,
             channels=gen_params['channels'],
             kernel_sizes=gen_params['kernel_sizes'],
-            fsq_levels=gen_params['fsq_levels']
+            fsq_levels=gen_params['fsq_levels'],
+            refiner_base_channels=gen_params.get('refiner_base_channels', 128),
+            refiner_depth=gen_params.get('refiner_depth', 3),
+            refiner_hidden_proj_divisor=gen_params.get('refiner_hidden_proj_divisor', 8),
+            inference=True,
         )
 
         # --- Dummy Inputs for Tracing ---
-        trace_len = 512
+        trace_len = 513
         print(f"Using fixed sequence length for tracing: {trace_len}")
         dummy_spec = torch.randn(1, trace_len, mel_channels, device=device)
         dummy_lengths = torch.tensor([trace_len], device=device, dtype=torch.long)
         dummy_mask = sequence_mask(trace_len, dummy_lengths).unsqueeze(1)
         dummy_indices = torch.randint(0, model.codebook_size, (1, trace_len), device=device, dtype=torch.long)
+
+        _ = model.decode(dummy_indices, dummy_mask)
 
         # --- Trace Module ---
         try:

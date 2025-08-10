@@ -30,7 +30,11 @@ def reencode_spectrograms(checkpoint_path, config, input_dir, output_dir, device
             mel_channels=model_params['mel_channels'],
             channels=gen_params['channels'],
             kernel_sizes=gen_params['kernel_sizes'],
-            fsq_levels=gen_params['fsq_levels']
+            fsq_levels=gen_params['fsq_levels'],
+            refiner_base_channels=gen_params.get('refiner_base_channels', 128),
+            refiner_depth=gen_params.get('refiner_depth', 3),
+            refiner_hidden_proj_divisor=gen_params.get('refiner_hidden_proj_divisor', 8),
+            inference=True,
         )
     except (FileNotFoundError, RuntimeError, KeyError) as e:
         print(f"Error: Could not load the model. {e}")
