@@ -476,39 +476,65 @@ class CausalConv1da(nn.Conv1d):
 class ResidualBlock1D(nn.Module):
     """
     Conv1D+Squeeze-Excite+LayerNorm residual block for sequence modeling with optional masking.
+    Includes up/downsampling via strided convolutions.
 
     Accepts an optional x_mask (batch, 1, len) bool Tensor where padded elements are True.
     If provided, the mask is applied with .masked_fill() before each activation.
+    The block also correctly transforms and returns the mask.
     """
 
-    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, dropout=0.3, act="relu", causal=False, norm="layer"):
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, dropout=0.3, act="relu", causal=False, norm="layer", stride=1):
         super(ResidualBlock1D, self).__init__()
+
+        self.stride = stride
+        self.causal = causal
+        if self.stride != 1 and self.causal:
+            raise ValueError("Causal convolutions do not support striding.")
 
         assert norm in ["weight", "layer", "instance"], f"Unknown normalization type {norm}, must be 'weight', 'layer', or 'instance'"
 
-        if causal:
+        # Determine padding for strided convolutions
+        if self.stride > 1: # Downsampling
+            # Classic formula to approximate "same" padding for strided convs
+            padding = (kernel_size - self.stride) // 2
+        elif self.stride < 0: # Upsampling
+            padding = (kernel_size - abs(self.stride)) // 2
+        else: # stride == 1
+            padding = "same" if not self.causal else 0
+
+
+        # Layer definitions
+        if self.causal:
             self.conv1 = CausalConv1da(in_channels, out_channels, kernel_size, dilation=dilation, use_weight_norm = norm == "weight")
             self.conv2 = CausalConv1da(out_channels, out_channels, kernel_size, dilation=dilation,  use_weight_norm = norm == "weight")
             self.cbam = None
         else:
-            self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, dilation=dilation, padding="same")
+            # Upsampling
+            if self.stride < 0:
+                s = abs(self.stride)
+                self.conv1 = nn.ConvTranspose1d(in_channels, out_channels, kernel_size, stride=s, padding=padding)
+            # Downsampling or no-op
+            else:
+                self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, dilation=dilation, padding=padding, stride=self.stride)
+
             self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, dilation=dilation, padding="same")
             self.cbam = CBAM1D(out_channels, causal=False) # CBAM1D is not causal by default
 
+        # Normalization layers
         if norm == "weight":
-            if not causal:
+            if not self.causal:
                 self.conv1 = weight_norm(self.conv1)
                 self.conv2 = weight_norm(self.conv2)
-
             self.norm1 = nn.Identity()
             self.norm2 = nn.Identity()
         elif norm == "layer":
             self.norm1 = TransposeLayerNorm(out_channels)
             self.norm2 = TransposeLayerNorm(out_channels)
-        else:
+        else: # instance
             self.norm1 = nn.InstanceNorm1d(out_channels, affine=True)
             self.norm2 = nn.InstanceNorm1d(out_channels, affine=True)
 
+        # Activation and dropout
         if act == "taptx":
             self.relu = APTx(trainable=True)
         elif act == "aptx":
@@ -519,33 +545,61 @@ class ResidualBlock1D(nn.Module):
             raise RuntimeError(f"Unknown activation: {act}")
         self.dropout = nn.Dropout(dropout)
 
-        self.residual = nn.Conv1d(in_channels, out_channels,
-                                  kernel_size=1) if in_channels != out_channels else nn.Identity()
+        # Residual connection
+        if in_channels != out_channels or self.stride != 1:
+            if self.stride > 1: # Downsample
+                self.residual = nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=self.stride)
+            elif self.stride < 0: # Upsample
+                self.residual = nn.Sequential(
+                    nn.Upsample(scale_factor=abs(self.stride), mode='nearest'),
+                    nn.Conv1d(in_channels, out_channels, kernel_size=1)
+                )
+            else: # Stride is 1, but channels are different
+                self.residual = nn.Conv1d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.residual = nn.Identity()
+
 
     def forward(self, x, x_mask=None):
         """
         Forward pass through the Residual Block 1D
         :param x: Input size (B, Cin, T)
         :param x_mask: Boolean sequence mask size (B, 1, T) where True=padded
-        :return: Output size (B, Cout, T)
+        :return: Tuple of (Output size (B, Cout, T_out), updated_mask (B, 1, T_out))
         """
+        # --- Adjust mask for up/downsampling ---
+        if x_mask is not None:
+            if self.stride > 1:
+                # Downsample mask by taking the max over the stride window
+                x_mask = F.max_pool1d(x_mask.float(), self.stride, self.stride).bool()
+            elif self.stride < 0:
+                # Upsample mask
+                x_mask = F.interpolate(x_mask.float(), scale_factor=abs(self.stride), mode='nearest').bool()
+
+        # --- Main path ---
         residual = self.residual(x)
         out = self.conv1(x)
+
+        # Correct padding for ConvTranspose1d to match residual length
+        if isinstance(self.conv1, nn.ConvTranspose1d):
+            if out.shape[-1] != residual.shape[-1]:
+                diff = out.shape[-1] - residual.shape[-1]
+                out = out[..., diff // 2 : out.shape[-1] - (diff - diff // 2)]
+
         out = self.norm1(out)
-        # Apply mask before the first activation if provided
         if x_mask is not None:
             out = out.masked_fill(x_mask, 0)
         out = self.relu(out)
-
 
         out = self.conv2(out)
         out = self.norm2(out)
         if self.cbam is not None:
             out = self.cbam(out, x_mask) # Pass mask to CBAM
+
+        # --- Add residual and finalize ---
         out += residual
-        # Apply mask before the second activation if provided
         if x_mask is not None:
             out = out.masked_fill(x_mask, 0)
         out = self.relu(out)
         out = self.dropout(out)
-        return out
+        return out, x_mask

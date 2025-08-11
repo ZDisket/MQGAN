@@ -302,7 +302,7 @@ class ConvBlock2D(nn.Module):
 
 
 class PreEncoder(nn.Module):
-    def __init__(self, mel_channels, channels, kernel_sizes, fsq_levels=[8, 8, 5, 5, 5], dropout=0.1,
+    def __init__(self, mel_channels, channels, kernel_sizes, strides, fsq_levels=[8, 8, 5, 5, 5], dropout=0.1,
                  refiner_base_channels=128, refiner_depth=3, refiner_hidden_proj_divisor=8):
         """
         Spectrogram Pre-Encoder.
@@ -315,15 +315,23 @@ class PreEncoder(nn.Module):
             * The last element is the latent dimension.
           - kernel_sizes (list of ints): list of kernel sizes for each ResidualBlock1D.
             Length should be len(channels) - 1. The decoder will use these lists in reverse.
+          - strides (list of ints): list of strides for each ResidualBlock1D.
         """
         super(PreEncoder, self).__init__()
         # Project input from mel_channels to channels[0]
         self.proj = nn.Linear(mel_channels, channels[0])
         self.pre = ConvBlock2D(1, channels[0], kernel_size=5, depthwise=True, act="aptx")
         self.quantizer_dim = len(fsq_levels)
+
+        # Calculate total downsampling factor
+        self.total_downsample_factor = 1
+        for s in strides:
+            if s > 1:
+                self.total_downsample_factor *= s
+
         # Encoder: build a sequence of ResidualBlock1D modules
         self.encoder_blocks = nn.ModuleList([
-            ResidualBlock1D(channels[i], channels[i + 1], kernel_size=kernel_sizes[i], dropout=dropout, act="taptx",
+            ResidualBlock1D(channels[i], channels[i + 1], kernel_size=kernel_sizes[i], stride=strides[i], dropout=dropout, act="taptx",
                             norm="weight")
             for i in range(len(channels) - 1)
         ])
@@ -343,9 +351,11 @@ class PreEncoder(nn.Module):
         # Decoder: use the reversed lists so that the decoder mirrors the encoder.
         rev_channels = list(reversed(channels))
         rev_kernel_sizes = list(reversed(kernel_sizes))
+        rev_strides = [-s for s in reversed(strides)] # Invert strides for upsampling
+
         self.decoder_blocks = nn.ModuleList([
-            ResidualBlock1D(rev_channels[i], rev_channels[i + 1], kernel_size=rev_kernel_sizes[i], dropout=dropout,
-                            act="taptx", causal=True, norm="weight")
+            ResidualBlock1D(rev_channels[i], rev_channels[i + 1], kernel_size=rev_kernel_sizes[i], stride=rev_strides[i], dropout=dropout,
+                            act="taptx", causal=False, norm="weight") # Decoder is not causal
             for i in range(len(rev_channels) - 1)
         ])
         self.post = ConvBlock2D(1, channels[0], kernel_size=5, depthwise=True, act="aptx")
@@ -358,8 +368,6 @@ class PreEncoder(nn.Module):
         self.refiner = UNetRefiner(in_channels=1, base_ch=refiner_base_channels, depth=refiner_depth,
                                    input_out_channels=[mel_channels + self.refiner_hidden_channels, mel_channels])
 
-        # self.refiner = torch.jit.script(self.refiner)
-
     def forward(self, x, x_lengths):
         """
         Forward pass, for training only. For inference see .encode and .decode
@@ -371,20 +379,25 @@ class PreEncoder(nn.Module):
           - x: Reconstructed tensor of shape (batch, mel_len, mel_channels)
           - x_post: Reconstructed and refined tensor of shape (batch, mel_len, mel_channels)
         """
+        max_len = x.size(1)
+
+        # Pad to be divisible by total downsample factor
+        pad_len = (self.total_downsample_factor - (max_len % self.total_downsample_factor)) % self.total_downsample_factor
+        x = F.pad(x, (0, 0, 0, pad_len)) # Pad (B, T, C) on the T dimension
+
         # Project input to channel dimension channels[0]
-        x = self.proj(x)  # (batch, mel_len, channels[0])
-        # Permute to (batch, channels[0], mel_len) for 1D convolutions.
+        x = self.proj(x)  # (batch, mel_len_padded, channels[0])
+        # Permute to (batch, channels[0], mel_len_padded) for 1D convolutions.
         x = x.permute(0, 2, 1)
 
-        x_mask_orig = sequence_mask(x.size(2), x_lengths)
-        x_mask = x_mask_orig.unsqueeze(1)  # (B, 1, T)
+        x_mask = sequence_mask(x.size(2), x_lengths).unsqueeze(1)  # (B, 1, T_padded)
         x = self.pre(x, x_mask)
 
         # Pass through the encoder blocks
         for block in self.encoder_blocks:
-            x = block(x, x_mask=x_mask)
+            x, x_mask = block(x, x_mask=x_mask)
 
-        # Permute back to (batch, mel_len, latent_dim)
+        # Permute back to (batch, mel_len_downsampled, latent_dim)
         x = x.permute(0, 2, 1)
         x = self.q_in_proj(x)
         xhat, indices = self.quantizer(x)
@@ -394,109 +407,118 @@ class PreEncoder(nn.Module):
 
         # Pass through the decoder blocks
         decoder_out = x
+        # The mask from the encoder is downsampled, so we create a new one for the decoder
+        decode_mask = torch.zeros((x.size(0), 1, x.size(2)), device=x.device).bool()
         for block in self.decoder_blocks:
-            decoder_out = block(decoder_out, x_mask=x_mask)
+            decoder_out, decode_mask = block(decoder_out, x_mask=decode_mask)
 
-        x_recon_chans = self.post(decoder_out, x_mask)
-        # Permute back to (batch, mel_len, channels[0])
+        x_recon_chans = self.post(decoder_out, decode_mask)
+        # Permute back to (batch, mel_len_padded, channels[0])
         x_recon_chans = x_recon_chans.permute(0, 2, 1)
         # Final projection back to mel_channels
         x_recon = self.out_proj(x_recon_chans)
 
         # Refiner step:
-        # 1. Project hidden state to mel_channels
         hidden_for_refiner = self.hidden_proj(decoder_out.permute(0, 2, 1))
 
-        refiner_in = torch.cat([x_recon, hidden_for_refiner], dim=2)  # append (B, T, Cmel + Chid)
-        refiner_in = refiner_in.unsqueeze(1)  # (B, 1, T, Cmel + Chid)
-        # 3. Calculate residual
+        refiner_in = torch.cat([x_recon, hidden_for_refiner], dim=2)  # append (B, T_padded, Cmel + Chid)
+        refiner_in = refiner_in.unsqueeze(1)  # (B, 1, T_padded, Cmel + Chid)
+        
+        refiner_mask = sequence_mask(refiner_in.size(2), x_lengths)
         residual = self.refiner(
-            refiner_in.detach(),  # Detach: We want only the refiner to receive GAN gradients.
-            x_mask_orig)
+            refiner_in.detach(),
+            refiner_mask)
         x_post = x_recon + residual
+
+        # Trim padding
+        x_recon = x_recon[:, :max_len, :]
+        x_post = x_post[:, :max_len, :]
 
         return x_recon, x_post
 
-    def encode(self, x, x_mask=None):
+    def encode(self, x: torch.Tensor, x_lengths: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Encodes the input spectrogram into discrete latent indices.
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch, mel_len, mel_channels).
-          - x_mask: Tensor of shape (batch, mel_len), bool where padded positions are True.
-                   (This mask will be passed to each ResidualBlock1D, which is assumed to apply
-                   .masked_fill(x_mask, 0) before its activation calls.)
+            x_lengths (Optional[torch.Tensor]): Tensor of shape (batch,) with the real length of each sequence.
+                                                 If None, assumes all sequences in the batch are of length mel_len.
         Returns:
             indices (torch.Tensor): Discrete token indices from the vector quantizer.
+            x_lengths (torch.Tensor): Original lengths of the input sequences for use in decode.
         """
-        # Project input to latent_dim
+        max_len = x.size(1)
+        if x_lengths is None:
+            x_lengths = torch.tensor([max_len] * x.size(0), device=x.device, dtype=torch.long)
+
+        pad_len = (self.total_downsample_factor - (max_len % self.total_downsample_factor)) % self.total_downsample_factor
+        x = F.pad(x, (0, 0, 0, pad_len))
+
         x = self.proj(x)
-        # Permute to (batch, latent_dim, mel_len) for convolutional operations
         x = x.permute(0, 2, 1)
 
-        if x_mask is None:
-            x_mask = torch.zeros((x.size(0), 1, x.size(2)), device=x.device).bool()
+        x_mask = sequence_mask(x.size(2), x_lengths).unsqueeze(1)
 
         x = self.pre(x, x_mask)
 
-        # Pass through the encoder blocks
         for block in self.encoder_blocks:
-            x = block(x, x_mask=x_mask)
-        # Permute back to (batch, mel_len, latent_dim)
-        x = x.permute(0, 2, 1)
-        # Project to quantizer input dimension (e.g. 4)
-        x = self.q_in_proj(x)
-        # Quantize and obtain indices
-        _, indices = self.quantizer(x)
-        return indices.long()  # otherwise cross entropy loss bitches later
+            x, x_mask = block(x, x_mask=x_mask)
 
-    def decode(self, indices, x_mask=None, return_hidden=False):
+        x = x.permute(0, 2, 1)
+        x = self.q_in_proj(x)
+        _, indices = self.quantizer(x)
+        return indices.long(), x_lengths
+
+    def decode(self, indices: torch.Tensor, original_lengths: Optional[torch.Tensor] = None, return_hidden: bool = False):
         """
         Decodes discrete latent indices into a reconstructed spectrogram.
 
         Args:
             indices (torch.Tensor): Discrete token indices from the vector quantizer.
+            original_lengths (Optional[torch.Tensor]): Original lengths to zero-out padding in the output batch.
+                                                      If None, no masking is done.
 
         Returns:
             x (torch.Tensor): Reconstructed spectrogram of shape (batch, mel_len, mel_channels).
         """
-        # Convert indices to quantized latent codes (shape: (batch, mel_len, 4))
         xhat = self.quantizer.indices_to_codes(indices)
-        # Project quantized representation back to latent_dim
         x = self.q_out_proj(xhat)
-        # Permute to (batch, latent_dim, mel_len) for convolutional operations
-
         x = x.permute(0, 2, 1)
 
-        if x_mask is None:
-            x_mask = torch.zeros((x.size(0), 1, x.size(2)), device=x.device).bool()
+        x_mask = torch.zeros((x.size(0), 1, x.size(2)), device=x.device).bool()
 
-        # Pass through the decoder blocks
         decoder_out = x
         for block in self.decoder_blocks:
-            decoder_out = block(decoder_out, x_mask=x_mask)
+            decoder_out, x_mask = block(decoder_out, x_mask=x_mask)
 
         if return_hidden:
             last_hid = decoder_out.clone()
 
         x_recon_chans = self.post(decoder_out, x_mask)
-        # Permute back to (batch, mel_len, latent_dim)
         x_recon_chans = x_recon_chans.permute(0, 2, 1)
-        # Project back to the original mel_channels
         x_recon = self.out_proj(x_recon_chans)
 
-        # Refiner step:
-        # 1. Project hidden state to mel_channels
         hidden_for_refiner = self.hidden_proj(decoder_out.permute(0, 2, 1))
 
-        refiner_in = torch.cat([x_recon, hidden_for_refiner], dim=2)  # append (B, T, Cmel + Chid)
-        refiner_in = refiner_in.unsqueeze(1)  # (B, 1, T, Cmel + Chid)
+        refiner_in = torch.cat([x_recon, hidden_for_refiner], dim=2)
+        refiner_in = refiner_in.unsqueeze(1)
 
-        # 3. Calculate residual
+        # Create a mask for the refiner based on the upsampled lengths
+        if original_lengths is not None:
+            # This mask should correspond to the padded length *before* the refiner
+            refiner_mask = sequence_mask(refiner_in.size(2), original_lengths)
+        else:
+            refiner_mask = torch.zeros((refiner_in.size(0), refiner_in.size(2)), device=refiner_in.device).bool()
+
         residual = self.refiner(
-            refiner_in.detach(),  # Detach: We want only the refiner to receive GAN gradients.
-            x_mask.squeeze(1))  # x_mask is (B, 1, T), refiner expects (B, T)
+            refiner_in.detach(),
+            refiner_mask)
         x_post = x_recon + residual
+
+        if original_lengths is not None:
+            out_mask = sequence_mask(x_post.size(1), original_lengths)
+            x_post.masked_fill_(out_mask.unsqueeze(-1), 0.0)
 
         if return_hidden:
             return x_post, last_hid
