@@ -10,7 +10,7 @@ This repository contains the implementation of (MQGAN) for audio synthesis. The 
     *   [Re-encoding Spectrograms (Optional)](#re-encoding-spectrograms-optional)
 3.  [Training the PreEncoder Model](#3-training-the-preencoder-model)
 4.  [Exporting to TorchScript](#4-exporting-to-torchscript)
-5.  [Project Structure](#5-project-structure)
+5.  [Pretrained Models](#5-pretrained-models)
 
 ---
 
@@ -97,59 +97,6 @@ The `PreEncoder` model is trained using `train.py`. This script handles the GAN 
 2.  **Configure training parameters:**
     Edit a training configuration file (e.g., `model_config_hifimusic.yaml` or `model_config_hifispeech.yaml`). This file defines model architecture, training hyperparameters, loss weights, and data paths.
 
-    Example `model_config_hifimusic.yaml` (excerpt):
-    ```yaml
-    project_name: "MQGAN-Music"
-    data:
-      data_dir: "path/to/your/mel_spectrograms" # Output from convert_spectrograms.py
-      output_dir: "checkpoints/music_preencoder"
-      batch_size: 32
-      num_workers: 8
-      validation_split: 0.05
-      crop_len: [256, 384, 512] # Randomly crop to one of these lengths per batch
-    model:
-      mel_channels: 80
-      generator:
-        channels: [384, 512, 768]
-        kernel_sizes: [7, 5, 3]
-        fsq_levels: [8, 8, 5, 5, 5]
-        dropout: 0.1
-      discriminator_patch:
-        hidden_channels: 128
-        kernel_sizes: [5, 3]
-        strides: [2, 2]
-      discriminator_multibin:
-        hidden_channels: 128
-        kernel_sizes: [5, 3]
-        n_bins: 3
-        n_no_strides: 1
-    training:
-      num_epochs: 1000
-      lr: 0.0001
-      beta1: 0.5
-      beta2: 0.9
-      lr_d_factor: 1.0
-      d_beta1: 0.5
-      d_beta2: 0.9
-      warmup_steps: 1000
-      discriminator_train_start_epoch: 1
-      use_fm_loss: True
-      loss_weights:
-        recon_lambda: 1.0
-        Gloss_lambda: 1.0
-        fm_lambda: 1.0
-      clip_grad_norm: 1.0
-      seed: 42
-      no_cuda: False
-      pretrained: null # Path to a .pth checkpoint for resuming training or fine-tuning
-    logging:
-      wandb:
-        entity: "your-wandb-entity" # Your WandB username or team name
-      eval_interval: 10
-      save_interval: 50
-      num_plot_examples: 5
-    ```
-
 3.  **Start training:**
     ```bash
     python train.py --config configs/model_config_hifimusic.yaml
@@ -199,32 +146,11 @@ Once your `PreEncoder` model is trained, you can export it to TorchScript for ea
     print(f"Reconstructed mel shape: {reconstructed_mel.shape}")
     ```
 
-## 5. Project Structure
+## 5. Pretrained Models
 
-```
-MQGAN/
-├───__init__.py
-├───.gitignore
-├───attentions.py             # Attention mechanisms and residual blocks
-├───convert_spectrograms.py   # Script to convert audio to Mel spectrograms
-├───convert_to_torchscript.py # Script to export trained PreEncoder to TorchScript
-├───discriminators.py         # Discriminator models (Patch, MultiBin)
-├───feature_extractors.py     # Feature extraction utilities
-├───losses.py                 # Custom loss functions (LSGAN, MaskedMelLoss)
-├───preencoder.py             # Defines the PreEncoder (generator) model
-├───quantizer.py              # Finite Scalar Quantizer (FSQ) implementation
-├───README.md                 # This file
-├───reencode_spectrograms.py  # Re-encodes spectrograms using a TorchScript model
-├───reencode_spectrograms_from_checkpoint.py # Re-encodes spectrograms using a raw checkpoint
-├───requirements.txt          # Python dependencies
-├───scripted_preencoder.py    # Wrapper for using TorchScript-exported PreEncoder
-├───spec_config_hifispeech.yaml # Example config for speech spectrograms
-├───spec_config_speech.yaml   # Example config for speech spectrograms
-├───spec_config.yaml          # Default spectrogram conversion config
-├───stft.py                   # Short-Time Fourier Transform utilities
-├───train_music_lstm_v2.py    # (Optional) Training script for music LSTM (separate from MQGAN)
-├───train.py                  # Main training script for the MQGAN PreEncoder
-└───configs/                  # Directory for model and spectrogram configurations
-    ├───model_config_hifimusic.yaml  # Example model config for music
-    └───model_config_hifispeech.yaml # Example model config for speech
-```
+We provide a selection of pretrained MQGAN models for different audio domains. These models include both the PreEncoder (quantizer) and the iSTFTNet components.
+
+| Model Name             | Sampling Rate | Mel params (channels, fmin-max) | Link to Pretrained Models (Quantizer & iSTFTNet)                            | Colab Notebook Example |
+|:-----------------------| :--- |:--------------------------------|:----------------------------------------------------------------------------| :--- |
+| *MQGAN+R-HifiSpeech-1* | *44.1 kHz* | *120, 0-22050 Hz*               | *[MQGAN](https://huggingface.co/ZDisket/mqganplusR-hifispeech), [ISTFTNet](https://huggingface.co/ZDisket/istftnet-hifispeech)* | *[Colab Link](https://colab.research.google.com/drive/1aXQtm1ZoIe8ACMV_Vgb-M9PZVQjuvhhB?usp=sharing)* |
+
