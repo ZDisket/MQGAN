@@ -1,3 +1,5 @@
 torch
 einx
 einops
+PyYAML
+wandb

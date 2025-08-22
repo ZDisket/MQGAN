@@ -1,0 +1,16 @@
+# spec_config.yaml
+
+io:
+  input_folder: "data/input_audio"
+  output_folder: "data/spectrograms"
+  audio_extensions: [".wav", ".mp3", ".flac", ".aac", ".ogg", ".m4a", ".wma", ".aif", ".aiff", ".opus", ".amr"]
+
+spectrogram:
+  sampling_rate: 44100
+  filter_length: 2048
+  hop_length: 512
+  win_length: 2048
+  n_mel_channels: 160
+  mel_fmin: 0.0
+  mel_fmax: 22050.0 
+  target_amplitude: 0.95

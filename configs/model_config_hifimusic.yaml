@@ -1,0 +1,58 @@
+
+# Configuration for MQGAN training
+
+project_name: "MQGAN"
+
+data:
+  data_dir: 'data/real'
+  output_dir: 'training_output'
+  validation_split: 0.1
+  crop_len: 256
+  batch_size: 16
+  num_workers: 0
+
+model:
+  mel_channels: 160 # Number of mel frequency channels
+  generator:
+    channels: [384, 384, 512, 512]
+    kernel_sizes: [3, 3, 5, 7]
+    dropout: 0.0
+    fsq_levels: [8, 5, 5, 5]
+    refiner_base_channels: 96
+    refiner_depth: 3
+  discriminator_patch:
+    hidden_channels: [384, 384, 512, 512, 512]
+    kernel_sizes: [7, 7, 5, 5, 3, 3]
+    strides: [[1, 2], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2]]
+  discriminator_multibin:
+    hidden_channels: [128, 256, 256, 256, 256]
+    kernel_sizes: [7, 5, 5, 3, 3, 3]
+    n_bins: 8
+    n_no_strides: 2
+
+training:
+  num_epochs: 1000
+  lr: 0.0001
+  beta1: 0.9
+  beta2: 0.999
+  lr_d_factor: 1.15
+  d_beta1: 0.5
+  d_beta2: 0.999
+  warmup_steps: 3000
+  discriminator_train_start_epoch: 0
+  loss_weights:
+    fm_lambda: 0.25
+    Gloss_lambda: 15.0
+    recon_lambda: 15.0
+  use_fm_loss: False
+  seed: 42
+  no_cuda: False
+  pretrained: null # path to pretrained model, or null
+
+logging:
+  eval_interval: 5
+  save_interval: 10
+  num_plot_examples: 3
+  wandb:
+    entity: null # Your wandb entity
+    project: "MQGAN"

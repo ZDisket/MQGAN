@@ -5,7 +5,7 @@ from torch.nn.utils import spectral_norm
 from typing import Union, Tuple, List # Added typing imports
 
 # Import sequence_mask from the preencoder module within the same package
-from .preencoder import sequence_mask
+from preencoder import sequence_mask
 
 class ChannelSELayerMasked(nn.Module):
     """
